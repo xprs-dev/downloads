@@ -1,0 +1,117 @@
+name: publish downloads
+
+# Serve the current XPRS release files on https://xprs.dev/downloads/<tag>/.
+#
+# Nothing binary is committed here. Each run takes the newest stable release and
+# the newest release overall from xprs-dev/app's GitHub Releases, lays their
+# files out as a site, and deploys that to GitHub Pages as an artifact. This
+# repository is a project site of the xprs-dev organisation, so Pages serves it
+# under the organisation site's domain, at xprs.dev/downloads.
+#
+# These are the files the update feed (xprs.dev/updates/*.json, written by
+# xprs-dev.github.io's sync.yml) points at. The feed sync waits until a release
+# is here, so the feed never names a file that is not there yet. An XPRS phone
+# normally fetches the bytes by sha256 over Reticulum from an always-on station;
+# this site is the fallback for a phone with no station in reach, and the
+# download page's links.
+#
+# Only two releases are live at a time (a few hundred MB, well inside Pages'
+# 1 GB). Every release ever made stays on the GitHub releases page.
+
+on:
+  schedule:
+    - cron: '30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # tags.txt, the record of what is deployed
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  APP_REPO: xprs-dev/app
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same choice sync.yml makes: a tag with a '-' is a pre-release.
+      - name: Resolve the releases to serve
+        id: tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NEWEST=$(gh release list -R "$APP_REPO" --limit 1 --exclude-drafts \
+            --json tagName --jq '.[0].tagName')
+          STABLE=$(gh release list -R "$APP_REPO" --limit 30 \
+            --json tagName,isPrerelease,isDraft \
+            --jq '[.[] | select(.isPrerelease==false and .isDraft==false)][0].tagName')
+          TAGS=$(printf '%s\n' "$STABLE" "$NEWEST" | grep . | sort -u | tr '\n' ' ' | sed 's/ $//')
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "serving: $TAGS"
+          if [ "$(cat tags.txt 2>/dev/null)" = "$TAGS" ]; then
+            echo "current=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Lay out the site
+        if: steps.tags.outputs.current != 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          touch site/.nojekyll
+          {
+            echo '<!doctype html><meta charset="utf-8"><title>XPRS downloads</title>'
+            echo '<h1>XPRS downloads</h1>'
+            echo '<p>The current release files. Every release is on'
+            echo "<a href=\"https://github.com/$APP_REPO/releases\">GitHub</a>.</p>"
+          } > site/index.html
+          for tag in ${{ steps.tags.outputs.tags }}; do
+            gh release download "$tag" -R "$APP_REPO" -D "site/$tag" \
+              -p '*-android-*.apk' -p '*-linux-x64.tar.gz' -p '*-setup.exe'
+            ( cd "site/$tag" && sha256sum -- * > SHA256SUMS )
+            {
+              echo "<h2>$tag</h2><ul>"
+              for f in "site/$tag"/*; do
+                n=$(basename "$f"); echo "<li><a href=\"$tag/$n\">$n</a></li>"
+              done
+              echo '</ul>'
+            } >> site/index.html
+          done
+          echo "${{ steps.tags.outputs.tags }}" > site/tags.txt
+          du -sh site; ls -lR site
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.tags.outputs.current != 'yes'
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        if: steps.tags.outputs.current != 'yes'
+        uses: actions/deploy-pages@v4
+
+      # A record of what is deployed, and the commit that keeps the schedule
+      # alive: GitHub disables the cron of a repository with no commit in 60
+      # days.
+      - name: Record what is deployed
+        if: steps.tags.outputs.current != 'yes'
+        run: |
+          set -euo pipefail
+          echo "${{ steps.tags.outputs.tags }}" > tags.txt
+          git config user.name  'xprs-release-bot'
+          git config user.email 'noreply@xprs.dev'
+          git add tags.txt
+          git diff --cached --quiet || git commit -m "serve ${{ steps.tags.outputs.tags }}"
+          git push
