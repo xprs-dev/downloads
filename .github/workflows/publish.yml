@@ -114,4 +114,12 @@ jobs:
           git config user.email 'noreply@xprs.dev'
           git add tags.txt
           git diff --cached --quiet || git commit -m "serve ${{ steps.tags.outputs.tags }}"
+          # A scheduled and a manual run can overlap and both push here.
+          # Replay this commit on top of the other one; -X theirs keeps this
+          # run's tags.txt, and a commit that becomes identical is dropped.
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            sleep $((attempt * 5))
+            git pull --rebase -X theirs origin main
+          done
           git push
