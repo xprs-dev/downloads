@@ -35,12 +35,17 @@ concurrency:
 env:
   APP_REPO: xprs-dev/app
 
+# Three jobs, as GitHub's own Pages template has them: the deploy runs in a job
+# of its own after the upload's job has finished. Deploying in the same job,
+# right after the upload, failed with "No artifacts named github-pages" four
+# runs in a row on 2026-11-25 (actions/deploy-pages#451), and 1.14.1-beta.5
+# never reached this site.
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+    outputs:
+      tags: ${{ steps.tags.outputs.tags }}
+      current: ${{ steps.tags.outputs.current }}
     steps:
       - uses: actions/checkout@v4
 
@@ -97,23 +102,33 @@ jobs:
         with:
           path: site
 
+  deploy:
+    needs: build
+    if: needs.build.outputs.current != 'yes'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
       - name: Deploy to GitHub Pages
         id: deploy
-        if: steps.tags.outputs.current != 'yes'
         uses: actions/deploy-pages@v4
 
-      # A record of what is deployed, and the commit that keeps the schedule
-      # alive: GitHub disables the cron of a repository with no commit in 60
-      # days.
+  # A record of what is deployed, and the commit that keeps the schedule
+  # alive: GitHub disables the cron of a repository with no commit in 60 days.
+  record:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Record what is deployed
-        if: steps.tags.outputs.current != 'yes'
         run: |
           set -euo pipefail
-          echo "${{ steps.tags.outputs.tags }}" > tags.txt
+          echo "${{ needs.build.outputs.tags }}" > tags.txt
           git config user.name  'xprs-release-bot'
           git config user.email 'noreply@xprs.dev'
           git add tags.txt
-          git diff --cached --quiet || git commit -m "serve ${{ steps.tags.outputs.tags }}"
+          git diff --cached --quiet || git commit -m "serve ${{ needs.build.outputs.tags }}"
           # A scheduled and a manual run can overlap and both push here.
           # Replay this commit on top of the other one; -X theirs keeps this
           # run's tags.txt, and a commit that becomes identical is dropped.
